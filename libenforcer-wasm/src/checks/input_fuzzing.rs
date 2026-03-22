@@ -120,33 +120,27 @@ struct FuzzEvent {
     target_key: (i32, i32),
 }
 
-/// Get the neighbor offsets for a given coordinate classification.
-///
-/// Both Deadzone and NonCardinal use a full 3×3 neighborhood (minus center)
-/// because the fuzzer adds ±1 to BOTH axes independently. For Deadzone targets,
-/// the zero-axis fuzz offsets create coordinates that would otherwise be classified
-/// as NonCardinal and lost. Expanding to 8 neighbors captures them; the fuzzability
-/// flags (x_fuzzable/y_fuzzable) still correctly limit which axis deltas are scored.
-fn neighbor_offsets_for(_coord: &Coord, class: &CoordClass) -> Vec<(i32, i32)> {
-    match class {
-        CoordClass::Deadzone | CoordClass::NonCardinal => {
-            vec![
-                (-1, -1), (-1, 0), (-1, 1),
-                (0, -1),           (0, 1),
-                (1, -1),  (1, 0),  (1, 1),
-            ]
-        }
-        _ => vec![],
-    }
+/// 8-neighbor offsets for adjacency in a 3×3 grid (excluding center).
+const NEIGHBOR_OFFSETS: [(i32, i32); 8] = [
+    (-1, -1), (-1, 0), (-1, 1),
+    (0, -1),           (0, 1),
+    (1, -1),  (1, 0),  (1, 1),
+];
+
+/// Check whether a coordinate key is fuzzable (requires fuzzing analysis).
+fn is_fuzzable_key(key: (i32, i32)) -> bool {
+    let coord = Coord::new(key.0 as f64 * UNIT, key.1 as f64 * UNIT);
+    matches!(classify_coord(&coord), CoordClass::Deadzone | CoordClass::NonCardinal)
 }
 
 /// Cluster holds into targets and compute per-event fuzz deltas.
 ///
 /// Algorithm:
 /// 1. Group holds by integer coordinate key
-/// 2. Identify targets: each key that is the most frequent in its fuzz neighborhood
-/// 3. Detect contested keys: coordinates that fall in the fuzz zone of multiple targets
-/// 4. Produce events only for unambiguous assignments (skip contested keys)
+/// 2. Find connected components of adjacent fuzzable keys (8-neighbor adjacency)
+/// 3. Validate each component fits within a 3×3 bounding box (single fuzz target)
+/// 4. Compute weighted centroid of each valid component → inferred target
+/// 5. Produce events with deltas from each hold to its component's centroid target
 ///
 /// Returns only events for non-cardinal, non-origin coordinates (fuzzable targets).
 fn cluster_and_compute_deltas(holds: &[Hold]) -> Vec<FuzzEvent> {
@@ -157,86 +151,103 @@ fn cluster_and_compute_deltas(holds: &[Hold]) -> Vec<FuzzEvent> {
         *key_counts.entry(key).or_insert(0) += 1;
     }
 
-    // --- Pass 1: Identify all candidate targets ---
-    // A key is a target if no neighbor has a strictly higher count.
-    let mut target_keys: Vec<(i32, i32)> = Vec::new();
+    // --- Phase B: Find connected components of fuzzable keys ---
+    // Two fuzzable keys are adjacent if they differ by at most 1 on each axis.
+    let fuzzable_keys: Vec<(i32, i32)> = key_counts.keys()
+        .copied()
+        .filter(|&k| is_fuzzable_key(k))
+        .collect();
 
-    for &key in key_counts.keys() {
-        let coord = Coord::new(key.0 as f64 * UNIT, key.1 as f64 * UNIT);
-        let class = classify_coord(&coord);
+    let fuzzable_set: std::collections::HashSet<(i32, i32)> = fuzzable_keys.iter().copied().collect();
+    let mut visited: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
 
-        match class {
-            CoordClass::Cardinal | CoordClass::Origin | CoordClass::Rim => continue,
-            _ => {}
+    // key → component's target key
+    let mut key_to_target: HashMap<(i32, i32), (i32, i32)> = HashMap::new();
+    // target key → total holds in component (for cluster size filtering)
+    let mut target_hold_count: HashMap<(i32, i32), usize> = HashMap::new();
+
+    for &start in &fuzzable_keys {
+        if visited.contains(&start) {
+            continue;
         }
 
-        let my_count = key_counts[&key];
-        let offsets = neighbor_offsets_for(&coord, &class);
+        // BFS to find connected component
+        let mut component = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(start);
+        visited.insert(start);
 
-        let is_target = offsets.iter().all(|&(ox, oy)| {
-            let nkey = (key.0 + ox, key.1 + oy);
-            key_counts.get(&nkey).map_or(true, |&nc| nc <= my_count)
-        });
-
-        if is_target {
-            target_keys.push(key);
-        }
-    }
-
-    // --- Pass 2: For each key, find which target(s) claim it ---
-    // Build key → Vec<target_key> mapping to detect contested keys.
-    let mut key_claimants: HashMap<(i32, i32), Vec<(i32, i32)>> = HashMap::new();
-
-    for &tkey in &target_keys {
-        let coord = Coord::new(tkey.0 as f64 * UNIT, tkey.1 as f64 * UNIT);
-        let class = classify_coord(&coord);
-        let offsets = neighbor_offsets_for(&coord, &class);
-
-        // The target itself
-        if key_counts.contains_key(&tkey) {
-            key_claimants.entry(tkey).or_default().push(tkey);
-        }
-        // Its neighbors
-        for &(ox, oy) in &offsets {
-            let nkey = (tkey.0 + ox, tkey.1 + oy);
-            if key_counts.contains_key(&nkey) {
-                key_claimants.entry(nkey).or_default().push(tkey);
+        while let Some(current) = queue.pop_front() {
+            component.push(current);
+            for &(ox, oy) in &NEIGHBOR_OFFSETS {
+                let neighbor = (current.0 + ox, current.1 + oy);
+                if fuzzable_set.contains(&neighbor) && !visited.contains(&neighbor) {
+                    visited.insert(neighbor);
+                    queue.push_back(neighbor);
+                }
             }
         }
-    }
 
-    // --- Pass 2b: Compute cluster size per target ---
-    // A target's cluster size = total holds across all unambiguous keys assigned to it.
-    // Targets with cluster_size=1 have a single hold that trivially sits at delta=0,
-    // providing no information about fuzzing presence. Exclude them.
-    let mut target_cluster_size: HashMap<(i32, i32), usize> = HashMap::new();
-    for (key, claimants) in &key_claimants {
-        if claimants.len() == 1 {
-            *target_cluster_size.entry(claimants[0]).or_insert(0) += key_counts[key];
+        // --- Phase C: Validate bounding box (must fit in 3×3) ---
+        let min_x = component.iter().map(|k| k.0).min().unwrap();
+        let max_x = component.iter().map(|k| k.0).max().unwrap();
+        let min_y = component.iter().map(|k| k.1).min().unwrap();
+        let max_y = component.iter().map(|k| k.1).max().unwrap();
+
+        if (max_x - min_x) > 2 || (max_y - min_y) > 2 {
+            continue; // Spans multiple targets, skip
         }
+
+        // Total holds in this component
+        let total_count: usize = component.iter()
+            .map(|k| key_counts.get(k).copied().unwrap_or(0))
+            .sum();
+
+        // Skip components with < 2 total holds (uninformative)
+        if total_count < 2 {
+            continue;
+        }
+
+        // Compute weighted centroid
+        let mut sum_x: f64 = 0.0;
+        let mut sum_y: f64 = 0.0;
+        for &k in &component {
+            let count = key_counts[&k] as f64;
+            sum_x += k.0 as f64 * count;
+            sum_y += k.1 as f64 * count;
+        }
+        let center_x = (sum_x / total_count as f64).round() as i32;
+        let center_y = (sum_y / total_count as f64).round() as i32;
+        let target_key = (center_x, center_y);
+
+        // Map all keys in this component to the centroid target
+        for &k in &component {
+            key_to_target.insert(k, target_key);
+        }
+
+        // Also map non-fuzzable neighbor keys (Cardinal, Rim, Origin) that are
+        // within ±1 of the centroid. These are fuzz offsets that landed on exempt
+        // coordinates (e.g., Deadzone target at raw 79 with +1 offset = Cardinal 80).
+        // Their holds still contribute to the delta distribution.
+        for &(ox, oy) in &NEIGHBOR_OFFSETS {
+            let nkey = (target_key.0 + ox, target_key.1 + oy);
+            if key_counts.contains_key(&nkey) && !key_to_target.contains_key(&nkey) {
+                key_to_target.insert(nkey, target_key);
+            }
+        }
+
+        target_hold_count.insert(target_key, total_count);
     }
 
-    // --- Pass 3: Produce events only for unambiguous keys ---
+    // --- Phase D: Produce FuzzEvents ---
     let mut events = Vec::new();
     for hold in holds {
         let key = coord_key(&hold.coord);
-        let claimants = match key_claimants.get(&key) {
-            Some(c) => c,
-            None => continue, // not claimed by any target
+        let target_key = match key_to_target.get(&key) {
+            Some(&tk) => tk,
+            None => continue, // Not in a valid fuzzable component
         };
 
-        // Skip contested keys (claimed by multiple targets)
-        if claimants.len() != 1 {
-            continue;
-        }
-
-        let target_key = claimants[0];
-
-        // Skip events from targets with only 1 hold in their cluster —
-        // a lone hold always has delta=0 and is uninformative.
-        if target_cluster_size.get(&target_key).copied().unwrap_or(0) < 2 {
-            continue;
-        }
         let target_coord = Coord::new(
             target_key.0 as f64 * UNIT,
             target_key.1 as f64 * UNIT,
@@ -246,7 +257,7 @@ fn cluster_and_compute_deltas(holds: &[Hold]) -> Vec<FuzzEvent> {
         let dx = key.0 - target_key.0;
         let dy = key.1 - target_key.1;
 
-        // Sanity: only include deltas within expected fuzz range
+        // Only include deltas within expected fuzz range
         if dx.abs() > 1 || dy.abs() > 1 {
             continue;
         }
@@ -732,11 +743,9 @@ mod tests {
     }
 
     #[test]
-    fn test_overlapping_targets_excluded() {
-        // Two targets 1 unit apart on X — their fuzz zones overlap.
-        // Target A at (0.5, 0.5), Target B at (0.5 + UNIT, 0.5).
-        // The coordinate (0.5 + UNIT, 0.5) is both B itself AND A's +1 fuzz output.
-        // These contested keys should be excluded from the analysis.
+    fn test_adjacent_targets_merged_into_cluster() {
+        // Two keys 1 unit apart on X form a single connected component.
+        // The centroid falls between them, and both keys produce valid events.
         let target_a = Coord::new(0.5, 0.5);
         let target_b = Coord::new(0.5 + UNIT, 0.5);
 
@@ -749,11 +758,11 @@ mod tests {
         let holds = identify_holds(&coords);
         let events = cluster_and_compute_deltas(&holds);
 
-        // Both target_a and target_b are within each other's fuzz zone,
-        // so both should be contested and produce no events.
+        // Both keys form a single component with centroid between them.
+        // All 40 holds should produce events.
         assert_eq!(
-            events.len(), 0,
-            "Overlapping targets should produce no events, got {}",
+            events.len(), 40,
+            "Adjacent keys should merge into one cluster, got {} events",
             events.len()
         );
     }

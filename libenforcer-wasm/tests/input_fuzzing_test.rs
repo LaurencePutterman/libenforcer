@@ -294,8 +294,6 @@ fn test_analyze_techno_illegal_player() {
     }
 }
 
-// ---- Diagnostic test: false positive investigation ----
-
 // ---- Regression test: fuzzing directory (known legal fuzzed controllers) ----
 
 #[test]
@@ -316,6 +314,52 @@ fn test_analyze_fuzzing_legal_player() {
     assert!(
         analysis.pass,
         "Port 0 (legally fuzzed) should PASS. LLR={:.4}, events={}, violations={:?}",
+        analysis.llr_score, analysis.total_fuzz_events,
+        analysis.violations.iter().map(|v| &v.reason).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_analyze_fuzzing_p1_legal() {
+    let data = read_slp_file("legal/digital/fuzzing/p1.slp");
+    let game = read_slippi(&mut Cursor::new(&data), None).unwrap();
+    let player_data = parser::extract_player_data(&game, 0).unwrap();
+
+    let analysis = input_fuzzing::analyze(&player_data.main_coords);
+
+    eprintln!(
+        "[p1 LEGAL] port 0: LLR={:.4}, events={}, x=[{},{},{}], y=[{},{},{}]",
+        analysis.llr_score, analysis.total_fuzz_events,
+        analysis.observed_x[0], analysis.observed_x[1], analysis.observed_x[2],
+        analysis.observed_y[0], analysis.observed_y[1], analysis.observed_y[2],
+    );
+
+    assert!(
+        analysis.pass,
+        "p1.slp port 0 (legally fuzzed) should PASS. LLR={:.4}, events={}, violations={:?}",
+        analysis.llr_score, analysis.total_fuzz_events,
+        analysis.violations.iter().map(|v| &v.reason).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_analyze_fuzzing_p4_legal() {
+    let data = read_slp_file("legal/digital/fuzzing/p4.slp");
+    let game = read_slippi(&mut Cursor::new(&data), None).unwrap();
+    let player_data = parser::extract_player_data(&game, 3).unwrap();
+
+    let analysis = input_fuzzing::analyze(&player_data.main_coords);
+
+    eprintln!(
+        "[p4 LEGAL] port 3: LLR={:.4}, events={}, x=[{},{},{}], y=[{},{},{}]",
+        analysis.llr_score, analysis.total_fuzz_events,
+        analysis.observed_x[0], analysis.observed_x[1], analysis.observed_x[2],
+        analysis.observed_y[0], analysis.observed_y[1], analysis.observed_y[2],
+    );
+
+    assert!(
+        analysis.pass,
+        "p4.slp port 3 (legally fuzzed) should PASS. LLR={:.4}, events={}, violations={:?}",
         analysis.llr_score, analysis.total_fuzz_events,
         analysis.violations.iter().map(|v| &v.reason).collect::<Vec<_>>()
     );
